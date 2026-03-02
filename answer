@@ -1,0 +1,61 @@
+程式架構摘要（FedFish + Ours）  
+
+1) 執行入口  
+   - `main.py` 解析 CLI → 載入 `Configs/Datasets/<task>/<dataset>/Default.yaml` → `simplify_cfg` 篩出當前 server/optim/attack → `show_cfg` → 設定隨機種子。  
+   - 依 `dataset` 選擇 `get_multi_domain_dataset` 或 `get_single_domain_dataset` 取得 `private_dataset`。  
+   - 產生惡意與良性客戶比例，對 train / test 套用 `backdoor_attack`。  
+   - `get_private_backbones` 為每個客戶複製一份模型 (ResNet / SimpleCNN)。  
+   - `get_fed_method`(預期 FedFish) 建立客戶端優化器；`get_server_method` 建立聚合器 (Ours)。  
+   - 呼叫 `train(fed_method, fed_server, private_dataset, args, cfg)` 進入聯邦迭代。  
+
+2) 資料與客戶端  
+   - `SingleDomainDataset`：`partition_label_skew_loaders` 以 Dirichlet(β) 將標籤分佈切成 `parti_num` 個 `train_loader`，並產生 `val_loader / test_loader`。  
+   - `MultiDomainDataset`：`partition_domain_loaders` 依 domain_ratio 對每個 domain 抽樣，形成多個 client `train_loader`、對應的 domain `train_eval_loader` 與 `test_loader`。  
+   - `Attack/backdoor/utils.py`：`base_backdoor`/`semantic_backdoor` 依觸發器設定改寫影像與標籤；惡意客戶的 `train_loader` 替換為含觸發器資料，並建立 `backdoor_test_loader`。  
+
+3) 客戶端優化器（FedFish）  
+   - 繼承 `FederatedOptim`：保存 `nets_list`、`prev_nets_list`、`local_fish_dict`、全域模型 `global_net`。  
+   - `ini`：複製初始全域權重到所有客戶與 `prev_nets_list`。  
+   - `loc_update`：選出線上客戶(目前全部) → 先算 Fisher (首輪) → 以 SGD(local_lr, local_epoch) 訓練每個客戶 → 複製當前模型到 `prev_nets_list` → 重新計算並存回每客戶 Fisher。  
+
+4) 伺服端聚合（Ours）  
+   - 基底 `ServerMethod.weight_calculate` 依各客戶 `train_loader` 樣本數計算頻率 `freq`。  
+   - 先用 `agg_parts` 依 `freq` 取得暫時的全域模型 `default_net`。  
+   - 將每客戶梯度向量 Fisher 正規化後做元素級加權，得 `weight_grad_list`；加權平均為 `weight_global_grad`。  
+   - 以 FINCH 對每客戶與全域梯度的 L2 距離做無參數分群；最大簇視為惡意，將其 `freq` 歸零並重正規化。  
+   - 對良性客戶再用 sigmoid(Fisher) 放大小梯度、抑制大梯度，修正參數；最後用重建後的 `freq` 經 `agg_parts` 同步更新全域與所有客戶模型。  
+   - 紀錄 `div_score`、`aggregation_weight` 供 CSV 日誌。  
+
+5) 訓練與評估 (`utils/training.py`)  
+   - 迴圈 `communication_epoch` 次：  
+     a) `fed_method.loc_update` 本地訓練＋Fisher。  
+     b) `fed_server.server_update` 檢測異常→聚合。  
+     c) 評估：標準測試集 top-1，若 backdoor 則額外量測攻擊成功率。  
+     d) `CsvWriter` 依攻擊/資料集/β/伺服端/優化器層級建目錄，寫入 `div_score`、`aggregation_weight`、精度與參數/配置檔。  
+
+6) 配置與工具  
+   - `utils/cfg.py` 定義基礎 `CFG`（DATASET/OPTIMIZER/attack/Server/Optim），`simplify_cfg` 只保留當前實驗需要的子樹。  
+   - `utils/conf.py` 提供路徑與裝置/隨機種子設定。  
+   - `utils/utils.py`：CLI 覆寫、client domain 隨機分配、權重轉 Tensor 等。  
+   - `Backbones`：ResNet10/18/34/50、SimpleCNN 供 `get_private_backbones` 複製。  
+
+7) 目前缺漏 / 風險  
+   - 匯入 `Attack.byzantine.utils`、`attack_dataset`、`attack_net_para` 的檔案不存在；`args.attack_type='byzantine'` 會失敗。  
+   - `Optims` 缺少 `get_fed_method` 與 `Fed_Optim_NAMES`，`args.optim` 的分派無法執行；FedFish 只能手動引用。  
+   - `main.py` 使用 `client_domain_list` 但未定義（應由 `ini_client_domain` 產生），執行會拋 NameError。  
+   - `utils/cfg.py` 的 `show_cfg` 函式缺少冒號，Python 無法解析。  
+
+ASCII 流程圖  
+main.py  
+  ├─ parse_args + cfg merge  
+  ├─ private_dataset = get_[single|multi]_domain_dataset()  
+  │    └─ partition loaders (+backdoor_attack) → train_loaders / val / test / backdoor_test  
+  ├─ models = get_private_backbones(cfg)  # per-client  
+  ├─ fed_method (FedFish) 初始化全域 & prev_nets  
+  ├─ fed_server (Ours)  
+  └─ train loop (communication_epoch):  
+        fed_method.loc_update → fisher + 本地 SGD  
+        fed_server.server_update → FINCH 偵測惡意 → 加權聚合  
+        evaluate + CsvWriter log/ckpt
+python main.py --dataset fl_fashionmnist --task label_skew --attack_type backdoor --server Ours--seed 0 --device_id 0
+python main.py --dataset fl_cifar10 --task label_skew --attack_type backdoor --server Ours--seed 0 --device_id 1
